@@ -5,16 +5,17 @@ import os
 
 os.system("pip install --no-build-isolation -e .")
 
+import cv2
 import time
+import torch
 import subprocess
 import numpy as np
-import torch
 from PIL import Image
-from cog import BasePredictor, Input, Path
-from sam2.build_sam import build_sam2
-from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+from typing import List
 import matplotlib.pyplot as plt
-import cv2
+from sam2.build_sam import build_sam2
+from cog import BasePredictor, Input, Path, BaseModel
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
 DEVICE = "cuda"
 MODEL_CACHE = "checkpoints"
@@ -39,12 +40,15 @@ def download_weights(url: str, dest: str) -> None:
     print("[+] Download completed in: ", time.time() - start, "seconds")
 
 
+class Output(BaseModel):
+    combined_mask: Path
+    individual_masks: List[Path]
+
+
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
 
-        # NOTE we download all weights no matter what
-        # TODO should be optimised and lazy loaded tbh
         if not os.path.exists(MODEL_CACHE):
             os.makedirs(MODEL_CACHE)
         model_files = [
@@ -61,15 +65,14 @@ class Predictor(BasePredictor):
                 download_weights(url, dest_path)
 
         # TODO: Add Lazy loading for the other versions
-        # self.model_configs = {
-        #     "tiny": ("sam2_hiera_t.yaml", "sam2_hiera_tiny.pt"),
-        #     "small": ("sam2_hiera_s.yaml", "sam2_hiera_small.pt"),
-        #     "base": ("sam2_hiera_b+.yaml", "sam2_hiera_base_plus.pt"),
-        #     "large": ("sam2_hiera_l.yaml", "sam2_hiera_large.pt"),
-        # }
+        self.model_configs = {
+            "tiny": ("sam2_hiera_t.yaml", f"{MODEL_CACHE}/sam2_hiera_tiny.pt"),
+            "small": ("sam2_hiera_s.yaml", f"{MODEL_CACHE}/sam2_hiera_small.pt"),
+            "base": ("sam2_hiera_b+.yaml", f"{MODEL_CACHE}/sam2_hiera_base_plus.pt"),
+            "large": ("sam2_hiera_l.yaml", f"{MODEL_CACHE}/sam2_hiera_large.pt"),
+        }
 
-        sam2_checkpoint = "checkpoints/sam2_hiera_large.pt"
-        model_cfg = "sam2_hiera_l.yaml"
+        model_cfg, sam2_checkpoint = self.model_configs["large"]
 
         self.sam2 = build_sam2(
             model_cfg, sam2_checkpoint, device="cuda", apply_postprocessing=False
@@ -95,7 +98,7 @@ class Predictor(BasePredictor):
             description="Stability score threshold", default=0.95
         ),
         use_m2m: bool = Input(description="Use M2M", default=True),
-    ) -> Path:
+    ) -> Output:
         """Run a single prediction on the model"""
         # Load and preprocess the image
         input_image = Image.open(image)
@@ -110,18 +113,33 @@ class Predictor(BasePredictor):
         # Generate masks
         masks = self.mask_generator.generate(input_image)
 
-        # Visualize results
+        # Generate and save combined colored mask
+        combined_mask_path = Path("/tmp/combined_mask.png")
+        self.save_combined_mask(input_image, masks, combined_mask_path)
+
+        # Generate and save individual black and white masks
+        individual_mask_paths = self.save_individual_masks(masks)
+
+        return Output(
+            combined_mask=combined_mask_path, individual_masks=individual_mask_paths
+        )
+
+    def save_combined_mask(self, input_image, masks, output_path):
         plt.figure(figsize=(20, 20))
         plt.imshow(input_image)
         self.show_anns(masks)
         plt.axis("off")
-
-        # Save the result
-        output_path = Path("output.png")
         plt.savefig(output_path, bbox_inches="tight", pad_inches=0)
         plt.close()
 
-        return output_path
+    def save_individual_masks(self, masks):
+        individual_mask_paths = []
+        for i, mask in enumerate(masks):
+            mask_image = mask["segmentation"].astype(np.uint8) * 255
+            mask_path = Path(f"/tmp/mask_{i}.png")
+            Image.fromarray(mask_image).save(mask_path)
+            individual_mask_paths.append(mask_path)
+        return individual_mask_paths
 
     def show_anns(self, anns):
         if len(anns) == 0:
