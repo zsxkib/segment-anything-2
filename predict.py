@@ -38,11 +38,6 @@ def download_weights(url: str, dest: str) -> None:
 
 
 class Output(BaseModel):
-    combined_mask: Path
-    individual_masks: List[Path]
-
-
-class Output(BaseModel):
     black_white_masks: List[Path]
     highlighted_frames: List[Path]
 
@@ -95,44 +90,27 @@ class Predictor(BasePredictor):
             default=15, description="Stride for visualizing frames"
         ),
     ) -> Output:
-        print("🚀 Starting prediction process...")
         start_time = time.time()
 
-        # Create a temporary directory for video frames
         video_dir = "video_frames"
         os.makedirs(video_dir, exist_ok=True)
-        print(f"📁 Created temporary directory: {video_dir}")
 
-        # Use ffmpeg to extract frames from the video
-        print("🎬 Extracting frames from video...")
         ffmpeg_start = time.time()
         ffmpeg_command = (
             f"ffmpeg -i {video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
         )
         subprocess.run(ffmpeg_command, shell=True, check=True)
-        print(
-            f"✅ Frame extraction completed in {time.time() - ffmpeg_start:.2f} seconds"
-        )
 
-        # Get frame names
         frame_names = [
             p
             for p in os.listdir(video_dir)
             if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg"]
         ]
         frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
-        print(f"🖼️ Total frames extracted: {len(frame_names)}")
 
-        # Initialize the inference state
-        print("🧠 Initializing inference state...")
         inference_start = time.time()
         inference_state = self.predictor.init_state(video_path=video_dir)
-        print(
-            f"✅ Inference state initialized in {time.time() - inference_start:.2f} seconds"
-        )
 
-        # Parse clicks, labels, and affected frames
-        print("👆 Parsing clicks, labels, and affected frames...")
         click_list = [
             list(map(int, click.split(",")))
             for click in clicks.strip("[]").split("],[")
@@ -145,6 +123,9 @@ class Predictor(BasePredictor):
                 "The number of clicks, labels, and affected frames must be the same."
             )
 
+        output_dir = Path("predict_outputs")
+        output_dir.mkdir(exist_ok=True)
+
         prompts = {}
         for i, (click, label, frame) in enumerate(
             zip(click_list, label_list, frame_list)
@@ -154,16 +135,23 @@ class Predictor(BasePredictor):
             points = np.array([[x, y]], dtype=np.float32)
             labels = np.array([label], np.int32)
             prompts[obj_id] = (frame, points, labels)
-            print(f"🔹 Click {i+1}: frame={frame}, x={x}, y={y}, label={label}")
 
             out_obj_ids, out_mask_logits = self.refine_mask(
                 inference_state, frame, obj_id, points, labels
             )
-        print(f"✅ Parsed {len(click_list)} clicks")
 
-        # Propagate masks through the video
-        print("🔄 Propagating masks through the video...")
-        propagation_start = time.time()
+            # Visualize each step
+            fig = plt.figure(figsize=(12, 8))
+            plt.title(f"frame {frame}")
+            plt.imshow(Image.open(os.path.join(video_dir, frame_names[frame])))
+            self.show_points(points, labels, plt.gca())
+            self.show_anns([(out_mask_logits[0] > 0.0).cpu().numpy()], [obj_id])
+
+            step_output = output_dir / f"step_{i+1}_frame_{frame}.png"
+            plt.savefig(step_output, bbox_inches="tight", pad_inches=0)
+            plt.close(fig)
+
+        # Propagate masks
         video_segments = {}
         for (
             out_frame_idx,
@@ -174,48 +162,31 @@ class Predictor(BasePredictor):
                 out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
                 for i, out_obj_id in enumerate(out_obj_ids)
             }
-            if out_frame_idx % 50 == 0:
-                print(f"🔹 Processed frame {out_frame_idx}")
-        print(
-            f"✅ Mask propagation completed in {time.time() - propagation_start:.2f} seconds"
-        )
 
-        # Create output directory
-        output_dir = Path("predict_outputs")
-        output_dir.mkdir(exist_ok=True)
-        print(f"📁 Created output directory: {output_dir}")
-
-        # Render and save the segmentation results
-        print("🎨 Rendering and saving segmentation results...")
-        render_start = time.time()
+        # Visualize results
         black_white_masks = []
         highlighted_frames = []
         for out_frame_idx in range(0, len(frame_names), vis_frame_stride):
-            # Create black and white mask
-            if video_segments[out_frame_idx]:  # Check if the dictionary is not empty
-                first_mask = next(iter(video_segments[out_frame_idx].values()))
-                combined_mask = np.zeros_like(first_mask.squeeze(), dtype=np.uint8)
-                for out_mask in video_segments[out_frame_idx].values():
-                    combined_mask |= out_mask.squeeze().astype(np.uint8)
-
-                # Ensure the mask is 2D before saving
-                if combined_mask.ndim == 3:
-                    combined_mask = combined_mask.squeeze()
-
-                bw_mask_path = output_dir / f"bw_mask_{out_frame_idx:05d}.png"
-                Image.fromarray(combined_mask * 255).save(bw_mask_path)
-                black_white_masks.append(bw_mask_path)
-
-            # Create highlighted frame
             fig = plt.figure(figsize=(12, 8))
             plt.title(f"frame {out_frame_idx}")
             plt.imshow(Image.open(os.path.join(video_dir, frame_names[out_frame_idx])))
 
-            masks = list(video_segments[out_frame_idx].values())
-            obj_ids = list(video_segments[out_frame_idx].keys())
-            self.show_anns(masks, obj_ids)
+            combined_mask = np.zeros_like(
+                next(iter(video_segments[out_frame_idx].values())).squeeze(),
+                dtype=np.uint8,
+            )
+            for out_obj_id, out_mask in video_segments[out_frame_idx].items():
+                mask = out_mask.squeeze().astype(np.uint8)
+                combined_mask |= mask
+                self.show_anns([mask], [out_obj_id])
+
             for frame, points, labels in prompts.values():
-                self.show_points(points, labels, plt.gca())
+                if frame == out_frame_idx:
+                    self.show_points(points, labels, plt.gca())
+
+            bw_mask_path = output_dir / f"bw_mask_{out_frame_idx:05d}.png"
+            Image.fromarray(combined_mask * 255).save(bw_mask_path)
+            black_white_masks.append(bw_mask_path)
 
             highlighted_frame_path = (
                 output_dir / f"highlighted_frame_{out_frame_idx:05d}.png"
@@ -224,24 +195,24 @@ class Predictor(BasePredictor):
             plt.close(fig)
             highlighted_frames.append(highlighted_frame_path)
 
-            if out_frame_idx % 50 == 0:
-                print(f"🖼️ Processed frame {out_frame_idx}")
-        print(f"✅ Rendering completed in {time.time() - render_start:.2f} seconds")
-
-        # Clean up temporary directory
-        print("🧹 Cleaning up temporary directory...")
         cleanup_start = time.time()
         for file in os.listdir(video_dir):
             os.remove(os.path.join(video_dir, file))
         os.rmdir(video_dir)
-        print(f"✅ Cleanup completed in {time.time() - cleanup_start:.2f} seconds")
-
-        total_time = time.time() - start_time
-        print(f"🏁 Prediction process completed in {total_time:.2f} seconds")
 
         return Output(
             black_white_masks=black_white_masks, highlighted_frames=highlighted_frames
         )
+
+    def refine_mask(self, inference_state, frame_idx, obj_id, points, labels):
+        _, out_obj_ids, out_mask_logits = self.predictor.add_new_points(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            points=points,
+            labels=labels,
+        )
+        return out_obj_ids, out_mask_logits
 
     def show_anns(self, anns, obj_ids):
         if len(anns) == 0:
@@ -280,13 +251,3 @@ class Predictor(BasePredictor):
             edgecolor="white",
             linewidth=1.25,
         )
-
-    def refine_mask(self, inference_state, frame_idx, obj_id, points, labels):
-        _, out_obj_ids, out_mask_logits = self.predictor.add_new_points(
-            inference_state=inference_state,
-            frame_idx=frame_idx,
-            obj_id=obj_id,
-            points=points,
-            labels=labels,
-        )
-        return out_obj_ids, out_mask_logits
