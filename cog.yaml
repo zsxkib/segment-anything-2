@@ -26,10 +26,8 @@ build:
     - "matplotlib>=3.9"
     - "jupyter>=1.0.0"
     - "opencv-python>=4.7.0"
-    - "black==24.2.0"
     - "usort==1.0.2"
     - "ufmt==2.0.0b2"
-    - "jupyter" # TODO: Remove later
 
   # commands run after the environment is setup
   run:
