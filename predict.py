@@ -86,16 +86,17 @@ class Predictor(BasePredictor):
         affected_frames: str = Input(
             description="List of frame indices for each click, e.g., '0,0,150,0'"
         ),
+        ann_obj_ids: str = Input(
+            description="List of object IDs corresponding to each click, e.g., '1,1,1,2'"
+        ),
         vis_frame_stride: int = Input(
             default=15, description="Stride for visualizing frames"
         ),
     ) -> Output:
-        start_time = time.time()
 
         video_dir = "video_frames"
         os.makedirs(video_dir, exist_ok=True)
 
-        ffmpeg_start = time.time()
         ffmpeg_command = (
             f"ffmpeg -i {video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
         )
@@ -108,7 +109,6 @@ class Predictor(BasePredictor):
         ]
         frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
 
-        inference_start = time.time()
         inference_state = self.predictor.init_state(video_path=video_dir)
 
         click_list = [
@@ -117,51 +117,64 @@ class Predictor(BasePredictor):
         ]
         label_list = list(map(int, labels.split(",")))
         frame_list = list(map(int, affected_frames.split(",")))
+        obj_id_list = list(map(int, ann_obj_ids.split(",")))
 
-        if not (len(click_list) == len(label_list) == len(frame_list)):
+        if not (
+            len(click_list) == len(label_list) == len(frame_list) == len(obj_id_list)
+        ):
             raise ValueError(
-                "The number of clicks, labels, and affected frames must be the same."
+                "The number of clicks, labels, affected frames, and object IDs must be the same."
             )
 
         output_dir = Path("predict_outputs")
         output_dir.mkdir(exist_ok=True)
 
         prompts = {}
-        for i, (click, label, frame) in enumerate(
-            zip(click_list, label_list, frame_list)
+        for i, (click, label, frame, obj_id) in enumerate(
+            zip(click_list, label_list, frame_list, obj_id_list)
         ):
-            obj_id = i + 1
             x, y = click
             points = np.array([[x, y]], dtype=np.float32)
             labels = np.array([label], np.int32)
-            prompts[obj_id] = (frame, points, labels)
 
-            out_obj_ids, out_mask_logits = self.refine_mask(
-                inference_state, frame, obj_id, points, labels
-            )
+            if obj_id not in prompts:
+                prompts[obj_id] = []
+            prompts[obj_id].append((frame, points, labels))
 
-            # Visualize each step
-            fig = plt.figure(figsize=(12, 8))
-            plt.title(f"frame {frame}")
-            plt.imshow(Image.open(os.path.join(video_dir, frame_names[frame])))
-            self.show_points(points, labels, plt.gca())
-            self.show_anns([(out_mask_logits[0] > 0.0).cpu().numpy()], [obj_id])
+        video_segments = {}
+        for obj_id, obj_prompts in prompts.items():
+            for frame, points, labels in obj_prompts:
+                out_obj_ids, out_mask_logits = self.refine_mask(
+                    inference_state, frame, obj_id, points, labels
+                )
 
-            step_output = output_dir / f"step_{i+1}_frame_{frame}.png"
-            plt.savefig(step_output, bbox_inches="tight", pad_inches=0)
-            plt.close(fig)
+                if frame not in video_segments:
+                    video_segments[frame] = {}
+                video_segments[frame][obj_id] = out_mask_logits[0].cpu().numpy()
+
+                # Visualize each step
+                fig = plt.figure(figsize=(12, 8))
+                plt.title(f"frame {frame}, object {obj_id}")
+                plt.imshow(Image.open(os.path.join(video_dir, frame_names[frame])))
+                self.show_points(points, labels, plt.gca())
+                self.show_anns([(out_mask_logits[0] > 0.0).cpu().numpy()], [obj_id])
+
+                step_output = output_dir / f"step_obj{obj_id}_frame_{frame}.png"
+                plt.savefig(step_output, bbox_inches="tight", pad_inches=0)
+                plt.close(fig)
 
         # Propagate masks
-        video_segments = {}
         for (
             out_frame_idx,
             out_obj_ids,
             out_mask_logits,
         ) in self.predictor.propagate_in_video(inference_state):
-            video_segments[out_frame_idx] = {
-                out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                for i, out_obj_id in enumerate(out_obj_ids)
-            }
+            if out_frame_idx not in video_segments:
+                video_segments[out_frame_idx] = {}
+            for i, out_obj_id in enumerate(out_obj_ids):
+                video_segments[out_frame_idx][out_obj_id] = (
+                    out_mask_logits[i].cpu().numpy()
+                )
 
         # Visualize results
         black_white_masks = []
@@ -173,20 +186,26 @@ class Predictor(BasePredictor):
 
             combined_mask = np.zeros_like(
                 next(iter(video_segments[out_frame_idx].values())).squeeze(),
-                dtype=np.uint8,
+                dtype=np.float32,
             )
             for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-                mask = out_mask.squeeze().astype(np.uint8)
-                combined_mask |= mask
-                self.show_anns([mask], [out_obj_id])
+                mask = out_mask.squeeze()
+                combined_mask = np.maximum(combined_mask, mask)
 
-            for frame, points, labels in prompts.values():
-                if frame == out_frame_idx:
-                    self.show_points(points, labels, plt.gca())
+            # Apply threshold to get final binary mask
+            final_mask = (combined_mask > 0.0).astype(np.uint8)
+
+            for obj_id, obj_prompts in prompts.items():
+                for frame, points, labels in obj_prompts:
+                    if frame == out_frame_idx:
+                        self.show_points(points, labels, plt.gca())
 
             bw_mask_path = output_dir / f"bw_mask_{out_frame_idx:05d}.png"
-            Image.fromarray(combined_mask * 255).save(bw_mask_path)
+            Image.fromarray(final_mask * 255).save(bw_mask_path)
             black_white_masks.append(bw_mask_path)
+
+            # Show the mask on the image
+            self.show_anns([final_mask], [1])  # Use a single color for all objects
 
             highlighted_frame_path = (
                 output_dir / f"highlighted_frame_{out_frame_idx:05d}.png"
