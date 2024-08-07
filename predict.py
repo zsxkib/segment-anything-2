@@ -85,6 +85,12 @@ class Predictor(BasePredictor):
         clicks: str = Input(
             description="List of click coordinates in format '[x,y],[x,y],...'"
         ),
+        labels: str = Input(
+            description="List of labels corresponding to clicks, e.g., '1,1,0,1'"
+        ),
+        affected_frames: str = Input(
+            description="List of frame indices for each click, e.g., '0,0,150,0'"
+        ),
         vis_frame_stride: int = Input(
             default=15, description="Stride for visualizing frames"
         ),
@@ -100,7 +106,9 @@ class Predictor(BasePredictor):
         # Use ffmpeg to extract frames from the video
         print("🎬 Extracting frames from video...")
         ffmpeg_start = time.time()
-        ffmpeg_command = f"ffmpeg -i {video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
+        ffmpeg_command = (
+            f"ffmpeg -i {video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
+        )
         subprocess.run(ffmpeg_command, shell=True, check=True)
         print(
             f"✅ Frame extraction completed in {time.time() - ffmpeg_start:.2f} seconds"
@@ -123,20 +131,33 @@ class Predictor(BasePredictor):
             f"✅ Inference state initialized in {time.time() - inference_start:.2f} seconds"
         )
 
-        # Parse clicks
-        print("👆 Parsing clicks...")
-        click_list = clicks.strip("[]").split("],[")
+        # Parse clicks, labels, and affected frames
+        print("👆 Parsing clicks, labels, and affected frames...")
+        click_list = [
+            list(map(int, click.split(",")))
+            for click in clicks.strip("[]").split("],[")
+        ]
+        label_list = list(map(int, labels.split(",")))
+        frame_list = list(map(int, affected_frames.split(",")))
+
+        if not (len(click_list) == len(label_list) == len(frame_list)):
+            raise ValueError(
+                "The number of clicks, labels, and affected frames must be the same."
+            )
+
         prompts = {}
-        for i, click in enumerate(click_list):
-            x, y = map(int, click.split(","))
+        for i, (click, label, frame) in enumerate(
+            zip(click_list, label_list, frame_list)
+        ):
             obj_id = i + 1
+            x, y = click
             points = np.array([[x, y]], dtype=np.float32)
-            labels = np.array([1], np.int32)  # Assume all clicks are positive
-            prompts[obj_id] = points, labels
-            print(f"🔹 Click {i+1}: x={x}, y={y}")
+            labels = np.array([label], np.int32)
+            prompts[obj_id] = (frame, points, labels)
+            print(f"🔹 Click {i+1}: frame={frame}, x={x}, y={y}, label={label}")
 
             out_obj_ids, out_mask_logits = self.refine_mask(
-                inference_state, 0, obj_id, points, labels
+                inference_state, frame, obj_id, points, labels
             )
         print(f"✅ Parsed {len(click_list)} clicks")
 
@@ -190,11 +211,15 @@ class Predictor(BasePredictor):
             plt.title(f"frame {out_frame_idx}")
             plt.imshow(Image.open(os.path.join(video_dir, frame_names[out_frame_idx])))
 
-            self.show_anns([mask for mask in video_segments[out_frame_idx].values()])
-            for points, labels in prompts.values():
+            masks = list(video_segments[out_frame_idx].values())
+            obj_ids = list(video_segments[out_frame_idx].keys())
+            self.show_anns(masks, obj_ids)
+            for frame, points, labels in prompts.values():
                 self.show_points(points, labels, plt.gca())
 
-            highlighted_frame_path = output_dir / f"highlighted_frame_{out_frame_idx:05d}.png"
+            highlighted_frame_path = (
+                output_dir / f"highlighted_frame_{out_frame_idx:05d}.png"
+            )
             plt.savefig(highlighted_frame_path, bbox_inches="tight", pad_inches=0)
             plt.close(fig)
             highlighted_frames.append(highlighted_frame_path)
@@ -215,24 +240,23 @@ class Predictor(BasePredictor):
         print(f"🏁 Prediction process completed in {total_time:.2f} seconds")
 
         return Output(
-            black_white_masks=black_white_masks,
-            highlighted_frames=highlighted_frames
+            black_white_masks=black_white_masks, highlighted_frames=highlighted_frames
         )
 
-    def show_anns(self, anns):
+    def show_anns(self, anns, obj_ids):
         if len(anns) == 0:
             return
-        sorted_anns = sorted(anns, key=(lambda x: np.sum(x)), reverse=True)
         ax = plt.gca()
         ax.set_autoscale_on(False)
 
-        img = np.zeros((*sorted_anns[0].shape[-2:], 4))
+        img = np.zeros((*anns[0].shape[-2:], 4))
         img[:, :, 3] = 0
 
-        for i, ann in enumerate(sorted_anns):
+        cmap = plt.get_cmap("tab10")
+        for ann, obj_id in zip(anns, obj_ids):
             m = ann.squeeze().astype(bool)
-            color_mask = np.concatenate([np.random.random(3), [0.35]])
-            img[m] = color_mask
+            color = np.array([*cmap(obj_id % 10)[:3], 0.6])
+            img[m] = color
         ax.imshow(img)
 
     def show_points(self, coords, labels, ax, marker_size=375):
