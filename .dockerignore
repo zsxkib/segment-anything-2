@@ -5,6 +5,10 @@
 # Replicate
 /checkpoints/
 /notebooks/
+*.mp4
+/predict_outputs/
+/video_predictor_example.py
+/video_frames/
 
 # Exclude Git files
 .git

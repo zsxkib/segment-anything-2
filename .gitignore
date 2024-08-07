@@ -9,3 +9,7 @@ _C.*
 outputs/*
 checkpoints/*.pt
 .cog
+*.mp4
+/predict_outputs/
+/video_frames/
+/video_predictor_example.py

@@ -42,22 +42,25 @@ class Output(BaseModel):
     individual_masks: List[Path]
 
 
+class Output(BaseModel):
+    black_white_masks: List[Path]
+    highlighted_frames: List[Path]
+
+
 class Predictor(BasePredictor):
     def setup(self) -> None:
-        """Load the model into memory to make running multiple predictions efficient"""
-        global build_sam2, SAM2AutomaticMaskGenerator
-        os.system("pip install --no-build-isolation -e .")
-        from sam2.build_sam import build_sam2
-        from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+        global build_sam2_video_predictor
+
+        try:
+            from sam2.build_sam import build_sam2_video_predictor
+        except ImportError:
+            print("sam2 not found. Installing...")
+            os.system("pip install --no-build-isolation -e .")
+            from sam2.build_sam import build_sam2_video_predictor
 
         if not os.path.exists(MODEL_CACHE):
             os.makedirs(MODEL_CACHE)
-        model_files = [
-            # "sam2_hiera_base_plus.pt",
-            "sam2_hiera_large.pt",
-            # "sam2_hiera_small.pt",
-            # "sam2_hiera_tiny.pt",
-        ]
+        model_files = ["sam2_hiera_large.pt"]
         for model_file in model_files:
             url = BASE_URL + model_file
             filename = url.split("/")[-1]
@@ -65,21 +68,10 @@ class Predictor(BasePredictor):
             if not os.path.exists(dest_path.replace(".tar", "")):
                 download_weights(url, dest_path)
 
-        # TODO: Add Lazy loading for the other versions
-        self.model_configs = {
-            "tiny": ("sam2_hiera_t.yaml", f"{MODEL_CACHE}/sam2_hiera_tiny.pt"),
-            "small": ("sam2_hiera_s.yaml", f"{MODEL_CACHE}/sam2_hiera_small.pt"),
-            "base": ("sam2_hiera_b+.yaml", f"{MODEL_CACHE}/sam2_hiera_base_plus.pt"),
-            "large": ("sam2_hiera_l.yaml", f"{MODEL_CACHE}/sam2_hiera_large.pt"),
-        }
+        model_cfg = "sam2_hiera_l.yaml"
+        sam2_checkpoint = f"{MODEL_CACHE}/sam2_hiera_large.pt"
 
-        model_cfg, sam2_checkpoint = self.model_configs["large"]
-
-        self.sam2 = build_sam2(
-            model_cfg, sam2_checkpoint, device="cuda", apply_postprocessing=False
-        )
-        self.mask_generator = None
-        self.last_params = None
+        self.predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
 
         # Enable bfloat16 and TF32 for better performance
         torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
@@ -89,137 +81,188 @@ class Predictor(BasePredictor):
 
     def predict(
         self,
-        image: Path = Input(description="Input image"),
-        points_per_side: int = Input(
-            description="Points per side for mask generation", default=32
+        video: Path = Input(description="Input video file"),
+        clicks: str = Input(
+            description="List of click coordinates in format '[x,y],[x,y],...'"
         ),
-        pred_iou_thresh: float = Input(
-            description="Predicted IOU threshold", default=0.88
-        ),
-        stability_score_thresh: float = Input(
-            description="Stability score threshold", default=0.95
-        ),
-        use_m2m: bool = Input(description="Use M2M", default=True),
-        mask_limit: int = Input(
-            default=-1,
-            description="Maximum number of masks to return. If -1, all masks will be returned.",
-        ),
-        points_per_batch: int = Input(
-            default=64,
-            description="Number of points processed simultaneously by the model",
-        ),
-        crop_n_layers: int = Input(
-            default=0,
-            description="If >0, mask prediction will be run on crops of the image",
-        ),
-        box_nms_thresh: float = Input(
-            default=0.7,
-            description="Box IoU cutoff for non-maximal suppression to filter duplicate masks",
-        ),
-        crop_n_points_downscale_factor: int = Input(
-            default=1,
-            description="Scale factor for number of points sampled in crop layers",
-        ),
-        min_mask_region_area: int = Input(
-            default=0, description="Minimum area for mask regions after postprocessing"
-        ),
-        multimask_output: bool = Input(
-            default=False,
-            description="Whether to output multiple masks at each grid point",
+        vis_frame_stride: int = Input(
+            default=15, description="Stride for visualizing frames"
         ),
     ) -> Output:
-        """Run a single prediction on the model"""
-        # Create a dictionary of the current parameters
-        current_params = {
-            "points_per_side": points_per_side,
-            "points_per_batch": points_per_batch,
-            "pred_iou_thresh": pred_iou_thresh,
-            "stability_score_thresh": stability_score_thresh,
-            "use_m2m": use_m2m,
-            "crop_n_layers": crop_n_layers,
-            "box_nms_thresh": box_nms_thresh,
-            "crop_n_points_downscale_factor": crop_n_points_downscale_factor,
-            "min_mask_region_area": min_mask_region_area,
-            "multimask_output": multimask_output,
-        }
+        print("🚀 Starting prediction process...")
+        start_time = time.time()
 
-        # Check if we need to reinitialize the mask generator
-        if self.mask_generator is None or self.last_params != current_params:
-            self.mask_generator = SAM2AutomaticMaskGenerator(
-                model=self.sam2, **current_params
-            )
-            self.last_params = current_params
+        # Create a temporary directory for video frames
+        video_dir = "video_frames"
+        os.makedirs(video_dir, exist_ok=True)
+        print(f"📁 Created temporary directory: {video_dir}")
 
-        # Load and preprocess the image
-        input_image = Image.open(image)
-        input_image = np.array(input_image.convert("RGB"))
-
-        # Generate masks
-        masks = self.mask_generator.generate(input_image)
-
-        # Sort masks by area (largest first) and apply mask limit if specified
-        masks = sorted(masks, key=lambda x: x["area"], reverse=True)
-        if mask_limit > 0:
-            masks = masks[:mask_limit]
-
-        # Create outputs folder if it doesn't exist
-        outputs_folder = Path("outputs")
-        outputs_folder.mkdir(exist_ok=True)
-
-        # Generate and save combined colored mask
-        combined_mask_path = outputs_folder / "combined_mask.png"
-        self.save_combined_mask(input_image, masks, combined_mask_path)
-
-        # Generate and save individual black and white masks
-        individual_mask_paths = self.save_individual_masks(masks, outputs_folder)
-
-        return Output(
-            combined_mask=combined_mask_path, individual_masks=individual_mask_paths
+        # Use ffmpeg to extract frames from the video
+        print("🎬 Extracting frames from video...")
+        ffmpeg_start = time.time()
+        ffmpeg_command = f"ffmpeg -i {video} -q:v 2 -start_number 0 {video_dir}/%05d.jpg"
+        subprocess.run(ffmpeg_command, shell=True, check=True)
+        print(
+            f"✅ Frame extraction completed in {time.time() - ffmpeg_start:.2f} seconds"
         )
 
-    def save_combined_mask(self, input_image, masks, output_path):
-        plt.figure(figsize=(20, 20))
-        plt.imshow(input_image)
-        self.show_anns(masks)
-        plt.axis("off")
-        plt.savefig(output_path, bbox_inches="tight", pad_inches=0)
-        plt.close()
+        # Get frame names
+        frame_names = [
+            p
+            for p in os.listdir(video_dir)
+            if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg"]
+        ]
+        frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+        print(f"🖼️ Total frames extracted: {len(frame_names)}")
 
-    def save_individual_masks(self, masks, output_folder):
-        individual_mask_paths = []
-        for i, mask in enumerate(masks):
-            mask_image = mask["segmentation"].astype(np.uint8) * 255
-            mask_path = output_folder / f"mask_{i}.png"
-            Image.fromarray(mask_image).save(mask_path)
-            individual_mask_paths.append(mask_path)
-        return individual_mask_paths
+        # Initialize the inference state
+        print("🧠 Initializing inference state...")
+        inference_start = time.time()
+        inference_state = self.predictor.init_state(video_path=video_dir)
+        print(
+            f"✅ Inference state initialized in {time.time() - inference_start:.2f} seconds"
+        )
+
+        # Parse clicks
+        print("👆 Parsing clicks...")
+        click_list = clicks.strip("[]").split("],[")
+        prompts = {}
+        for i, click in enumerate(click_list):
+            x, y = map(int, click.split(","))
+            obj_id = i + 1
+            points = np.array([[x, y]], dtype=np.float32)
+            labels = np.array([1], np.int32)  # Assume all clicks are positive
+            prompts[obj_id] = points, labels
+            print(f"🔹 Click {i+1}: x={x}, y={y}")
+
+            out_obj_ids, out_mask_logits = self.refine_mask(
+                inference_state, 0, obj_id, points, labels
+            )
+        print(f"✅ Parsed {len(click_list)} clicks")
+
+        # Propagate masks through the video
+        print("🔄 Propagating masks through the video...")
+        propagation_start = time.time()
+        video_segments = {}
+        for (
+            out_frame_idx,
+            out_obj_ids,
+            out_mask_logits,
+        ) in self.predictor.propagate_in_video(inference_state):
+            video_segments[out_frame_idx] = {
+                out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                for i, out_obj_id in enumerate(out_obj_ids)
+            }
+            if out_frame_idx % 50 == 0:
+                print(f"🔹 Processed frame {out_frame_idx}")
+        print(
+            f"✅ Mask propagation completed in {time.time() - propagation_start:.2f} seconds"
+        )
+
+        # Create output directory
+        output_dir = Path("predict_outputs")
+        output_dir.mkdir(exist_ok=True)
+        print(f"📁 Created output directory: {output_dir}")
+
+        # Render and save the segmentation results
+        print("🎨 Rendering and saving segmentation results...")
+        render_start = time.time()
+        black_white_masks = []
+        highlighted_frames = []
+        for out_frame_idx in range(0, len(frame_names), vis_frame_stride):
+            # Create black and white mask
+            if video_segments[out_frame_idx]:  # Check if the dictionary is not empty
+                first_mask = next(iter(video_segments[out_frame_idx].values()))
+                combined_mask = np.zeros_like(first_mask.squeeze(), dtype=np.uint8)
+                for out_mask in video_segments[out_frame_idx].values():
+                    combined_mask |= out_mask.squeeze().astype(np.uint8)
+
+                # Ensure the mask is 2D before saving
+                if combined_mask.ndim == 3:
+                    combined_mask = combined_mask.squeeze()
+
+                bw_mask_path = output_dir / f"bw_mask_{out_frame_idx:05d}.png"
+                Image.fromarray(combined_mask * 255).save(bw_mask_path)
+                black_white_masks.append(bw_mask_path)
+
+            # Create highlighted frame
+            fig = plt.figure(figsize=(12, 8))
+            plt.title(f"frame {out_frame_idx}")
+            plt.imshow(Image.open(os.path.join(video_dir, frame_names[out_frame_idx])))
+
+            self.show_anns([mask for mask in video_segments[out_frame_idx].values()])
+            for points, labels in prompts.values():
+                self.show_points(points, labels, plt.gca())
+
+            highlighted_frame_path = output_dir / f"highlighted_frame_{out_frame_idx:05d}.png"
+            plt.savefig(highlighted_frame_path, bbox_inches="tight", pad_inches=0)
+            plt.close(fig)
+            highlighted_frames.append(highlighted_frame_path)
+
+            if out_frame_idx % 50 == 0:
+                print(f"🖼️ Processed frame {out_frame_idx}")
+        print(f"✅ Rendering completed in {time.time() - render_start:.2f} seconds")
+
+        # Clean up temporary directory
+        print("🧹 Cleaning up temporary directory...")
+        cleanup_start = time.time()
+        for file in os.listdir(video_dir):
+            os.remove(os.path.join(video_dir, file))
+        os.rmdir(video_dir)
+        print(f"✅ Cleanup completed in {time.time() - cleanup_start:.2f} seconds")
+
+        total_time = time.time() - start_time
+        print(f"🏁 Prediction process completed in {total_time:.2f} seconds")
+
+        return Output(
+            black_white_masks=black_white_masks,
+            highlighted_frames=highlighted_frames
+        )
 
     def show_anns(self, anns):
         if len(anns) == 0:
             return
-        sorted_anns = sorted(anns, key=(lambda x: x["area"]), reverse=True)
+        sorted_anns = sorted(anns, key=(lambda x: np.sum(x)), reverse=True)
         ax = plt.gca()
         ax.set_autoscale_on(False)
 
-        img = np.ones(
-            (
-                sorted_anns[0]["segmentation"].shape[0],
-                sorted_anns[0]["segmentation"].shape[1],
-                4,
-            )
-        )
+        img = np.zeros((*sorted_anns[0].shape[-2:], 4))
         img[:, :, 3] = 0
-        for ann in sorted_anns:
-            m = ann["segmentation"]
-            color_mask = np.concatenate([np.random.random(3), [0.5]])
-            img[m] = color_mask
-            contours, _ = cv2.findContours(
-                m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
-            )
-            contours = [
-                cv2.approxPolyDP(contour, epsilon=0.01, closed=True)
-                for contour in contours
-            ]
-            cv2.drawContours(img, contours, -1, (0, 0, 1, 0.4), thickness=1)
 
+        for i, ann in enumerate(sorted_anns):
+            m = ann.squeeze().astype(bool)
+            color_mask = np.concatenate([np.random.random(3), [0.35]])
+            img[m] = color_mask
         ax.imshow(img)
+
+    def show_points(self, coords, labels, ax, marker_size=375):
+        pos_points = coords[labels == 1]
+        neg_points = coords[labels == 0]
+        ax.scatter(
+            pos_points[:, 0],
+            pos_points[:, 1],
+            color="green",
+            marker="*",
+            s=marker_size,
+            edgecolor="white",
+            linewidth=1.25,
+        )
+        ax.scatter(
+            neg_points[:, 0],
+            neg_points[:, 1],
+            color="red",
+            marker="*",
+            s=marker_size,
+            edgecolor="white",
+            linewidth=1.25,
+        )
+
+    def refine_mask(self, inference_state, frame_idx, obj_id, points, labels):
+        _, out_obj_ids, out_mask_logits = self.predictor.add_new_points(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            points=points,
+            labels=labels,
+        )
+        return out_obj_ids, out_mask_logits
